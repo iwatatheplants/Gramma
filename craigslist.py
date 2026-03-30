@@ -52,6 +52,8 @@ CONFIG = {
     "data_dir": "scout_data",
 }
 
+BATCH_PRESCREEN_SIZE = 8  # listings per Haiku batch prescreen call
+
 # ══════════════════════════════════════════════════════════════════
 # CONSOLIDATED SEARCHES — 5 broad feeds instead of 12 narrow ones
 # ══════════════════════════════════════════════════════════════════
@@ -389,23 +391,20 @@ class Monitor:
                              web_search=False, timeout=10)
 
     def prescreen_batch(self, items):
-        """Prescreen up to 10 listings in a single Haiku call. Much faster than one-at-a-time."""
+        """Send up to BATCH_PRESCREEN_SIZE listings to Haiku in one call — far faster than serial."""
         if not items:
             return []
         lines = "\n".join(
             f"{i+1}. Title: {it['title']}\n   Price: ${it['price']}{' (FREE)' if it['price'] == 0 else ''}\n   Category: {it['category']}"
             for i, it in enumerate(items)
         )
-        prompt = f"Evaluate these {len(items)} listings:\n\n{lines}"
-        result = self.api_call("claude-haiku-4-5-20251001", PRESCREEN_BATCH_PROMPT, prompt,
+        result = self.api_call("claude-haiku-4-5-20251001", PRESCREEN_BATCH_PROMPT,
+                               f"Evaluate these {len(items)} listings:\n\n{lines}",
                                web_search=False, timeout=15)
-        # result should be a list; fall back to individual prescreens if parsing failed
-        if not isinstance(result, list):
-            self.log.warning("Batch prescreen returned non-list — falling back to individual calls")
+        if not isinstance(result, list) or len(result) != len(items):
+            self.log.warning(f"Batch prescreen: expected {len(items)} results, got {type(result).__name__} — falling back")
             return [self.prescreen(it["title"], it["price"], it["category"]) for it in items]
-        # Build a dict keyed by 1-based index for safe lookup
-        by_n = {entry.get("n", i+1): entry for i, entry in enumerate(result)}
-        return [by_n.get(i+1, {"pass": False, "reason": "parse error"}) for i in range(len(items))]
+        return result
 
     def full_evaluate(self, listing):
         prompt = (
@@ -478,7 +477,6 @@ class Monitor:
     def cycle(self):
         """One full cycle: check all feeds for new listings."""
         new_total = 0
-        BATCH_SIZE = 8  # listings per Haiku batch prescreen call
         for s in SEARCHES:
             entries = self.fetch(s)
             new_entries = [e for e in entries if self._lid(e) not in self.seen]
@@ -498,30 +496,29 @@ class Monitor:
                     "price": self.price(e),
                 }
 
-            # Filter by max price before any API calls
             candidates = [e for e in new_entries if self.price(e) <= CONFIG["max_eval_price"]]
 
-            # ── STAGE 1: Batch Haiku pre-screens (1 API call per 8 listings vs 8 calls) ──
-            for batch_start in range(0, len(candidates), BATCH_SIZE):
-                batch = candidates[batch_start:batch_start + BATCH_SIZE]
+            # ── STAGE 1: Batch Haiku pre-screens ──
+            for batch_start in range(0, len(candidates), BATCH_PRESCREEN_SIZE):
+                batch = candidates[batch_start:batch_start + BATCH_PRESCREEN_SIZE]
                 batch_meta = [{"title": e.get("title", ""), "price": self.price(e), "category": s["category"]} for e in batch]
                 self.stats["prescreened"] += len(batch)
                 prescreens = self.prescreen_batch(batch_meta)
 
-                for entry, ps in zip(batch, prescreens):
+                for entry, ps, meta in zip(batch, prescreens, batch_meta):
                     if ps and ps.get("pass") is True:
                         self.stats["filtered"] += 1
                         continue
-                    # Passed pre-screen — extract image and do full eval
+                    price = meta["price"]
                     image_url = extract_image(entry)
                     if not image_url:
                         image_url = fetch_listing_image(entry.get("link"))
-                    self.log.info(f"  🔍 Evaluating: {entry.get('title','')[:65]} — {'FREE' if self.price(entry) == 0 else f'${self.price(entry)}'}")
+                    self.log.info(f"  🔍 Evaluating: {entry.get('title','')[:65]} — {'FREE' if price == 0 else f'${price}'}")
                     listing = {
                         "title": entry.get("title", ""),
                         "link": entry.get("link", ""),
                         "summary": entry.get("summary", ""),
-                        "price": self.price(entry),
+                        "price": price,
                         "cat": s["category"],
                         "search": s["name"],
                         "image_url": image_url,

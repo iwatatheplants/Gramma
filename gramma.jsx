@@ -94,7 +94,6 @@ export default function App(){
   const [copied,setCopied]=useState(null);
   const [danceMode,setDanceMode]=useState("walk"); // walk, twerk
   const [batchFiles,setBatchFiles]=useState([]);
-  const [batchRunning,setBatchRunning]=useState(false);
   const fileRefs=useRef({});const rRef=useRef(null);const listRef=useRef(null);const batchInputRef=useRef(null);
 
   useEffect(()=>{(async()=>{try{const r=await window.storage.get("gramma-h");if(r?.value)setHist(JSON.parse(r.value))}catch{}})()},[]);
@@ -102,6 +101,8 @@ export default function App(){
 
   // Cycle dance mode every few seconds while loading
   useEffect(()=>{if(!loading)return;const iv=setInterval(()=>setDanceMode(d=>d==="walk"?"twerk":"walk"),3000);return()=>clearInterval(iv)},[loading]);
+
+  const parseDataUrl=url=>({b64:url.split(",")[1],mt:url.match(/data:(image\/\w+);/)?.[1]||"image/jpeg"});
 
   const compressImage=useCallback((dataUrl,maxPx=1200,quality=0.82)=>new Promise(resolve=>{
     const img=new Image();img.onload=()=>{
@@ -135,23 +136,22 @@ export default function App(){
     setBatchFiles(prev=>[...prev,...items].slice(0,20));
   },[compressImage]);
 
+  const batchRunning=batchFiles.some(f=>f.status==="loading");
+
   const runBatchScan=useCallback(async()=>{
     const idle=batchFiles.filter(f=>f.status==="idle");
     if(!idle.length)return;
-    setBatchRunning(true);
     setBatchFiles(prev=>prev.map(f=>f.status==="idle"?{...f,status:"loading"}:f));
     await Promise.allSettled(idle.map(async item=>{
       try{
-        const b64=item.compressed.split(",")[1];
-        const mt=item.compressed.match(/data:(image\/\w+);/)?.[1]||"image/jpeg";
+        const {b64,mt}=parseDataUrl(item.compressed);
         const images=[{type:"text",text:"[Item photo]:"},{type:"image",source:{type:"base64",media_type:mt,data:b64}}];
         const result=await apiCall("claude-haiku-4-5-20251001",QUICK_SYS,"Quick-identify this vintage item for resale value.",false,images);
         setBatchFiles(prev=>prev.map(f=>f.id===item.id?{...f,status:"done",result}:f));
       }catch(e){
-        setBatchFiles(prev=>prev.map(f=>f.id===item.id?{...f,status:"error",error:e.message}:f));
+        setBatchFiles(prev=>prev.map(f=>f.id===item.id?{...f,status:"error",error:e?.message||String(e)||"Scan failed"}:f));
       }
     }));
-    setBatchRunning(false);
   },[batchFiles,apiCall]);
   const hasAnyPhoto=Object.values(photos).some(Boolean);
   const photoCount=Object.values(photos).filter(Boolean).length;
@@ -171,9 +171,9 @@ export default function App(){
   const buildImageContent=()=>{
     const uc=[];const labels={main:"Main item photo",mark:"Maker's mark / label",detail:"Construction detail",extra:"Additional detail"};
     for(const [id,data] of Object.entries(photos)){
-      if(data){const b=data.split(",")[1];const m=data.match(/data:(image\/\w+);/);
+      if(data){const {b64,mt}=parseDataUrl(data);
         uc.push({type:"text",text:`[${labels[id]}]:`});
-        uc.push({type:"image",source:{type:"base64",media_type:m?.[1]||"image/jpeg",data:b}});
+        uc.push({type:"image",source:{type:"base64",media_type:mt,data:b64}});
       }}return uc;
   };
 

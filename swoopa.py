@@ -238,21 +238,31 @@ class Pipeline:
             return list(set(ids))
         except: self.reconnect(); return []
 
-    def api_call(self, model, system, prompt, web_search=False, timeout=15):
+    def api_call(self, model, system, prompt, web_search=False, timeout=15, max_retries=3):
         k=CONFIG["anthropic_api_key"]
         if k=="YOUR_API_KEY_HERE": return None
-        body={"model":model,"max_tokens":2000 if web_search else 300,"system":system,
+        body={"model":model,"max_tokens":2000 if web_search else 600,"system":system,
             "messages":[{"role":"user","content":prompt}]}
         if web_search: body["tools"]=[{"type":"web_search_20250305","name":"web_search"}]
-        try:
-            r=requests.post("https://api.anthropic.com/v1/messages",
-                headers={"Content-Type":"application/json","x-api-key":k,"anthropic-version":"2023-06-01"},
-                json=body,timeout=timeout)
-            r.raise_for_status()
-            txt="".join(b["text"] for b in r.json()["content"] if b["type"]=="text")
-            m=re.search(r'\{[\s\S]*\}',txt.replace("```json","").replace("```","").strip())
-            return json.loads(m.group(0)) if m else None
-        except Exception as e: self.log.error(f"API ({model}): {e}"); return None
+        for attempt in range(max_retries):
+            try:
+                r=requests.post("https://api.anthropic.com/v1/messages",
+                    headers={"Content-Type":"application/json","x-api-key":k,"anthropic-version":"2023-06-01"},
+                    json=body,timeout=timeout)
+                if r.status_code==429:
+                    wait=2**attempt
+                    self.log.warning(f"Rate limited — retrying in {wait}s ({attempt+1}/{max_retries})")
+                    time.sleep(wait); continue
+                r.raise_for_status()
+                txt="".join(b["text"] for b in r.json()["content"] if b["type"]=="text")
+                m=re.search(r'\{[\s\S]*\}',txt.replace("```json","").replace("```","").strip())
+                return json.loads(m.group(0)) if m else None
+            except requests.exceptions.Timeout:
+                wait=2**attempt
+                self.log.warning(f"API timeout — retrying in {wait}s ({attempt+1}/{max_retries})")
+                if attempt<max_retries-1: time.sleep(wait)
+            except Exception as e: self.log.error(f"API ({model}): {e}"); return None
+        return None
 
     def notify(self, listing, ev):
         topic=CONFIG["ntfy_topic"]
@@ -336,7 +346,7 @@ class Pipeline:
         if not ev: self.stats["errors"]+=1; self.mail.store(mid,"+FLAGS","\\Seen") if CONFIG["mark_as_read"] else None; return
 
         v=ev.get("verdict","PASS"); md=ev.get("market_data",{})
-        nc=sum(len(md.get(k,[]) or []) for k in ["ebay_sold","firstdibs_active","chairish_active","poshmark_sold"])
+        nc=sum(len(md.get(k,[]) or []) for k in ["ebay_sold","firstdibs_active","chairish_active","poshmark_sold","auction_results"])
         self.stats["proc"]+=1; self.stats[{"STRONG BUY":"strong","BUY":"buys","MAYBE":"maybes"}.get(v,"passes")]+=1
 
         ic={"STRONG BUY":"⚡","BUY":"✓","MAYBE":"?","PASS":"✕"}.get(v,"·")

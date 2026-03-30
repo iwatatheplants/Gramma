@@ -200,6 +200,18 @@ pass=false (SEND TO FULL EVALUATION):
 WHEN IN DOUBT, pass=false. Missing a $500 deal costs far more than a $0.04 API call.
 ONLY output JSON."""
 
+PRESCREEN_BATCH_PROMPT = """You are a vintage furniture/clothing arbitrage pre-screener. Evaluate MULTIPLE listings at once.
+
+For each listing, apply the same rules:
+pass=true (SKIP): Generic mass-market (IKEA, Target, Ashley, Wayfair), clearly damaged/moldy, baby furniture/mattresses/appliances, fast-fashion (H&M, Zara, Shein).
+pass=false (EVALUATE): ANY designer brand, ANY vintage/MCM keywords (danish, teak, walnut, mid century), quality materials (brass, leather, solid wood), FREE real furniture, urgency signals (moving/estate/must go), suspiciously low price, anything ambiguous but possibly valuable.
+
+WHEN IN DOUBT → pass=false. Missing a deal is worse than one extra API call.
+
+Respond with ONLY a valid JSON array, one entry per listing in the same order:
+[{"n":1,"pass":true,"reason":"one sentence"},{"n":2,"pass":false,"reason":"one sentence"},...]
+ONLY JSON array."""
+
 FULL_PROMPT = """You are Gramma, a warm but sharp AI vintage appraiser for the SF Bay Area.
 
 Use web search for REAL price data from MULTIPLE sources:
@@ -335,34 +347,65 @@ class Monitor:
         m = re.search(r'\$(\d[\d,]*)', e.get("title", ""))
         return int(m.group(1).replace(",", "")) if m else 0
 
-    def api_call(self, model, system, prompt, web_search=False, timeout=15):
+    def api_call(self, model, system, prompt, web_search=False, timeout=15, max_retries=3):
         k = CONFIG["anthropic_api_key"]
         if k == "YOUR_API_KEY_HERE":
             return None
         body = {
             "model": model,
-            "max_tokens": 2000 if web_search else 300,
+            "max_tokens": 2000 if web_search else 600,
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
         }
         if web_search:
             body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
-        try:
-            r = requests.post("https://api.anthropic.com/v1/messages",
-                headers={"Content-Type": "application/json", "x-api-key": k, "anthropic-version": "2023-06-01"},
-                json=body, timeout=timeout)
-            r.raise_for_status()
-            txt = "".join(b["text"] for b in r.json()["content"] if b["type"] == "text")
-            m = re.search(r'\{[\s\S]*\}', txt.replace("```json", "").replace("```", "").strip())
-            return json.loads(m.group(0)) if m else None
-        except Exception as e:
-            self.log.error(f"API ({model.split('-')[1]}): {e}")
-            return None
+        for attempt in range(max_retries):
+            try:
+                r = requests.post("https://api.anthropic.com/v1/messages",
+                    headers={"Content-Type": "application/json", "x-api-key": k, "anthropic-version": "2023-06-01"},
+                    json=body, timeout=timeout)
+                if r.status_code == 429:
+                    wait = 2 ** attempt
+                    self.log.warning(f"Rate limited — retrying in {wait}s ({attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                txt = "".join(b["text"] for b in r.json()["content"] if b["type"] == "text")
+                m = re.search(r'\{[\s\S]*\}|\[[\s\S]*\]', txt.replace("```json", "").replace("```", "").strip())
+                return json.loads(m.group(0)) if m else None
+            except requests.exceptions.Timeout:
+                wait = 2 ** attempt
+                self.log.warning(f"API timeout — retrying in {wait}s ({attempt+1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+            except Exception as e:
+                self.log.error(f"API ({model.split('-')[1]}): {e}")
+                return None
+        return None
 
     def prescreen(self, title, price, category):
         prompt = f"Title: {title}\nPrice: ${price}{' (FREE)' if price == 0 else ''}\nCategory: {category}"
         return self.api_call("claude-haiku-4-5-20251001", PRESCREEN_PROMPT, prompt,
                              web_search=False, timeout=10)
+
+    def prescreen_batch(self, items):
+        """Prescreen up to 10 listings in a single Haiku call. Much faster than one-at-a-time."""
+        if not items:
+            return []
+        lines = "\n".join(
+            f"{i+1}. Title: {it['title']}\n   Price: ${it['price']}{' (FREE)' if it['price'] == 0 else ''}\n   Category: {it['category']}"
+            for i, it in enumerate(items)
+        )
+        prompt = f"Evaluate these {len(items)} listings:\n\n{lines}"
+        result = self.api_call("claude-haiku-4-5-20251001", PRESCREEN_BATCH_PROMPT, prompt,
+                               web_search=False, timeout=15)
+        # result should be a list; fall back to individual prescreens if parsing failed
+        if not isinstance(result, list):
+            self.log.warning("Batch prescreen returned non-list — falling back to individual calls")
+            return [self.prescreen(it["title"], it["price"], it["category"]) for it in items]
+        # Build a dict keyed by 1-based index for safe lookup
+        by_n = {entry.get("n", i+1): entry for i, entry in enumerate(result)}
+        return [by_n.get(i+1, {"pass": False, "reason": "parse error"}) for i in range(len(items))]
 
     def full_evaluate(self, listing):
         prompt = (
@@ -432,89 +475,83 @@ class Monitor:
         except Exception as e:
             self.log.error(f"ntfy: {e}")
 
-    def process(self, entry, search):
-        lid = self._lid(entry)
-        if lid in self.seen:
-            return
-        title = entry.get("title", "")
-        price = self.price(entry)
-        self.seen[lid] = {"ts": datetime.now().isoformat(), "title": title[:100], "price": price}
-
-        if price > CONFIG["max_eval_price"]:
-            return
-
-        # ── Extract image (non-blocking, quick) ──
-        image_url = extract_image(entry)
-
-        # ── STAGE 1: Haiku pre-screen (~1-2s) ──
-        self.stats["prescreened"] += 1
-        ps = self.prescreen(title, price, search["category"])
-        if ps and ps.get("pass") is True:
-            self.stats["filtered"] += 1
-            return
-
-        # Only fetch the full page image if we're going to evaluate
-        if not image_url:
-            image_url = fetch_listing_image(entry.get("link"))
-
-        self.log.info(f"🔍 Evaluating: {title[:65]} — {'FREE' if price == 0 else f'${price}'}")
-
-        listing = {
-            "title": title,
-            "link": entry.get("link", ""),
-            "summary": entry.get("summary", ""),
-            "price": price,
-            "cat": search["category"],
-            "search": search["name"],
-            "image_url": image_url,
-        }
-
-        # ── STAGE 2: Sonnet + multi-source web search (~10-20s) ──
-        ev = self.full_evaluate(listing)
-        if not ev:
-            self.stats["errors"] += 1
-            return
-
-        v = ev.get("verdict", "PASS")
-        md = ev.get("market_data", {})
-        nc = sum(len(md.get(k, []) or []) for k in
-                 ["ebay_sold", "firstdibs_active", "chairish_active", "poshmark_sold", "auction_results"])
-
-        self.stats["evaluated"] += 1
-        self.stats[{"STRONG BUY": "strong", "BUY": "buys", "MAYBE": "maybes"}.get(v, "passes")] += 1
-
-        ic = {"STRONG BUY": "⚡", "BUY": "✓", "MAYBE": "?", "PASS": "✕"}.get(v, "·")
-        self.log.info(
-            f"  {ic} {v} | {ev.get('brand_or_designer', '?')} | "
-            f"${ev.get('estimated_resale_low', 0)}-${ev.get('estimated_resale_high', 0)} | "
-            f"{nc} comps | {ev.get('ai_price_assessment', '?')}"
-        )
-
-        with open(self.lf, "a") as f:
-            f.write(json.dumps({
-                "ts": datetime.now().isoformat(),
-                "listing": listing,
-                "eval": ev,
-            }) + "\n")
-
-        if v in CONFIG["notify_verdicts"]:
-            self.notify(listing, ev)
-
     def cycle(self):
         """One full cycle: check all feeds for new listings."""
         new_total = 0
+        BATCH_SIZE = 8  # listings per Haiku batch prescreen call
         for s in SEARCHES:
             entries = self.fetch(s)
-            new_in_feed = 0
-            for e in entries:
-                if self._lid(e) not in self.seen:
-                    new_in_feed += 1
-                    self.process(e, s)
+            new_entries = [e for e in entries if self._lid(e) not in self.seen]
+            if not new_entries:
+                time.sleep(CONFIG["pause_between_feeds"])
+                continue
+
+            self.log.info(f"  📡 {s['name']}: {len(new_entries)} new")
+            new_total += len(new_entries)
+
+            # Mark all new entries as seen immediately (prevents re-processing on next cycle)
+            for e in new_entries:
+                lid = self._lid(e)
+                self.seen[lid] = {
+                    "ts": datetime.now().isoformat(),
+                    "title": e.get("title", "")[:100],
+                    "price": self.price(e),
+                }
+
+            # Filter by max price before any API calls
+            candidates = [e for e in new_entries if self.price(e) <= CONFIG["max_eval_price"]]
+
+            # ── STAGE 1: Batch Haiku pre-screens (1 API call per 8 listings vs 8 calls) ──
+            for batch_start in range(0, len(candidates), BATCH_SIZE):
+                batch = candidates[batch_start:batch_start + BATCH_SIZE]
+                batch_meta = [{"title": e.get("title", ""), "price": self.price(e), "category": s["category"]} for e in batch]
+                self.stats["prescreened"] += len(batch)
+                prescreens = self.prescreen_batch(batch_meta)
+
+                for entry, ps in zip(batch, prescreens):
+                    if ps and ps.get("pass") is True:
+                        self.stats["filtered"] += 1
+                        continue
+                    # Passed pre-screen — extract image and do full eval
+                    image_url = extract_image(entry)
+                    if not image_url:
+                        image_url = fetch_listing_image(entry.get("link"))
+                    self.log.info(f"  🔍 Evaluating: {entry.get('title','')[:65]} — {'FREE' if self.price(entry) == 0 else f'${self.price(entry)}'}")
+                    listing = {
+                        "title": entry.get("title", ""),
+                        "link": entry.get("link", ""),
+                        "summary": entry.get("summary", ""),
+                        "price": self.price(entry),
+                        "cat": s["category"],
+                        "search": s["name"],
+                        "image_url": image_url,
+                    }
+                    # ── STAGE 2: Sonnet + multi-source web search ──
+                    ev = self.full_evaluate(listing)
+                    if not ev:
+                        self.stats["errors"] += 1
+                        continue
+
+                    v = ev.get("verdict", "PASS")
+                    md = ev.get("market_data", {})
+                    nc = sum(len(md.get(k, []) or []) for k in
+                             ["ebay_sold", "firstdibs_active", "chairish_active", "poshmark_sold", "auction_results"])
+                    self.stats["evaluated"] += 1
+                    self.stats[{"STRONG BUY": "strong", "BUY": "buys", "MAYBE": "maybes"}.get(v, "passes")] += 1
+                    ic = {"STRONG BUY": "⚡", "BUY": "✓", "MAYBE": "?", "PASS": "✕"}.get(v, "·")
+                    self.log.info(
+                        f"    {ic} {v} | {ev.get('brand_or_designer', '?')} | "
+                        f"${ev.get('estimated_resale_low', 0)}-${ev.get('estimated_resale_high', 0)} | "
+                        f"{nc} comps | {ev.get('ai_price_assessment', '?')}"
+                    )
+                    with open(self.lf, "a") as f:
+                        f.write(json.dumps({"ts": datetime.now().isoformat(), "listing": listing, "eval": ev}) + "\n")
+                    if v in CONFIG["notify_verdicts"]:
+                        self.notify(listing, ev)
                     time.sleep(CONFIG["pause_between_evals"])
-            if new_in_feed > 0:
-                self.log.info(f"  📡 {s['name']}: {new_in_feed} new")
-            new_total += new_in_feed
+
             time.sleep(CONFIG["pause_between_feeds"])
+
         self._save()
         self.stats["cycles"] += 1
         return new_total

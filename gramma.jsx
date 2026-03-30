@@ -93,7 +93,9 @@ export default function App(){
   const [listing,setListing]=useState(null);const [listingLoading,setListingLoading]=useState(false);
   const [copied,setCopied]=useState(null);
   const [danceMode,setDanceMode]=useState("walk"); // walk, twerk
-  const fileRefs=useRef({});const rRef=useRef(null);const listRef=useRef(null);
+  const [batchFiles,setBatchFiles]=useState([]);
+  const [batchRunning,setBatchRunning]=useState(false);
+  const fileRefs=useRef({});const rRef=useRef(null);const listRef=useRef(null);const batchInputRef=useRef(null);
 
   useEffect(()=>{(async()=>{try{const r=await window.storage.get("gramma-h");if(r?.value)setHist(JSON.parse(r.value))}catch{}})()},[]);
   const sH=async h=>{setHist(h);try{await window.storage.set("gramma-h",JSON.stringify(h.slice(0,100)))}catch{}};
@@ -101,11 +103,56 @@ export default function App(){
   // Cycle dance mode every few seconds while loading
   useEffect(()=>{if(!loading)return;const iv=setInterval(()=>setDanceMode(d=>d==="walk"?"twerk":"walk"),3000);return()=>clearInterval(iv)},[loading]);
 
+  const compressImage=useCallback((dataUrl,maxPx=1200,quality=0.82)=>new Promise(resolve=>{
+    const img=new Image();img.onload=()=>{
+      let {width:w,height:h}=img;
+      if(w>maxPx||h>maxPx){if(w>h){h=Math.round(h*maxPx/w);w=maxPx;}else{w=Math.round(w*maxPx/h);h=maxPx;}}
+      const c=document.createElement('canvas');c.width=w;c.height=h;
+      c.getContext('2d').drawImage(img,0,0,w,h);resolve(c.toDataURL('image/jpeg',quality));
+    };img.src=dataUrl;
+  }),[]);
+
   const hFile=useCallback((slotId,f)=>{
     if(!f||!f.type.startsWith("image/"))return;
-    const r=new FileReader();r.onload=e=>{setPhotos(p=>({...p,[slotId]:e.target.result}));setPreviews(p=>({...p,[slotId]:e.target.result}));setRes(null);setErr(null);setPurchased(false);setListing(null)};r.readAsDataURL(f);
-  },[]);
+    const r=new FileReader();r.onload=async e=>{
+      const compressed=await compressImage(e.target.result);
+      setPhotos(p=>({...p,[slotId]:compressed}));
+      setPreviews(p=>({...p,[slotId]:e.target.result}));
+      setRes(null);setErr(null);setPurchased(false);setListing(null);
+    };r.readAsDataURL(f);
+  },[compressImage]);
   const removePhoto=id=>{setPhotos(p=>({...p,[id]:null}));setPreviews(p=>({...p,[id]:null}));setRes(null)};
+
+  const handleBatchSelect=useCallback(async files=>{
+    const items=await Promise.all(
+      Array.from(files).filter(f=>f.type.startsWith("image/")).slice(0,20).map(f=>new Promise(res=>{
+        const r=new FileReader();r.onload=async e=>{
+          const compressed=await compressImage(e.target.result);
+          res({id:Date.now()+Math.random(),preview:e.target.result,compressed,status:"idle",result:null,error:null});
+        };r.readAsDataURL(f);
+      }))
+    );
+    setBatchFiles(prev=>[...prev,...items].slice(0,20));
+  },[compressImage]);
+
+  const runBatchScan=useCallback(async()=>{
+    const idle=batchFiles.filter(f=>f.status==="idle");
+    if(!idle.length)return;
+    setBatchRunning(true);
+    setBatchFiles(prev=>prev.map(f=>f.status==="idle"?{...f,status:"loading"}:f));
+    await Promise.allSettled(idle.map(async item=>{
+      try{
+        const b64=item.compressed.split(",")[1];
+        const mt=item.compressed.match(/data:(image\/\w+);/)?.[1]||"image/jpeg";
+        const images=[{type:"text",text:"[Item photo]:"},{type:"image",source:{type:"base64",media_type:mt,data:b64}}];
+        const result=await apiCall("claude-haiku-4-5-20251001",QUICK_SYS,"Quick-identify this vintage item for resale value.",false,images);
+        setBatchFiles(prev=>prev.map(f=>f.id===item.id?{...f,status:"done",result}:f));
+      }catch(e){
+        setBatchFiles(prev=>prev.map(f=>f.id===item.id?{...f,status:"error",error:e.message}:f));
+      }
+    }));
+    setBatchRunning(false);
+  },[batchFiles,apiCall]);
   const hasAnyPhoto=Object.values(photos).some(Boolean);
   const photoCount=Object.values(photos).filter(Boolean).length;
 
@@ -255,8 +302,8 @@ input:focus,textarea:focus,select:focus{border-color:${G}!important}
 
       {/* TABS */}
       <div style={{display:"flex",borderBottom:`1px solid ${BD}`,padding:"0 12px",overflowX:"auto"}}>
-        {[["scan","Ask Gramma"],["history","History"],["brands","Brand DB"]].map(([k,l])=>(
-          <button key={k} onClick={()=>setTab(k)} style={{background:"none",border:"none",borderBottom:tab===k?`2px solid ${G}`:"2px solid transparent",color:tab===k?HI:DM,padding:"12px 14px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}}>{l}{k==="history"&&hist.length?` (${hist.length})`:""}</button>
+        {[["scan","Ask Gramma"],["batch","Batch Scan"],["history","History"],["brands","Brand DB"]].map(([k,l])=>(
+          <button key={k} onClick={()=>setTab(k)} style={{background:"none",border:"none",borderBottom:tab===k?`2px solid ${G}`:"2px solid transparent",color:tab===k?HI:DM,padding:"12px 14px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}}>{l}{k==="history"&&hist.length?` (${hist.length})`:""}{k==="batch"&&batchFiles.length?` (${batchFiles.length})`:""}</button>
         ))}
       </div>
 
@@ -320,7 +367,10 @@ input:focus,textarea:focus,select:focus{border-color:${G}!important}
         </div>}
 
         {(hasAnyPhoto||desc||res)&&!loading&&<button onClick={reset} style={{width:"100%",marginTop:6,padding:"10px",background:"none",border:`1px solid ${BD}`,borderRadius:10,color:DM,fontSize:12,cursor:"pointer"}}>Clear all</button>}
-        {err&&<div style={{marginTop:12,padding:"12px 16px",background:"#1a0505",border:"1px solid #450a0a",borderRadius:10,color:"#f87171",fontSize:13}}>{err}</div>}
+        {err&&<div style={{marginTop:12,padding:"12px 16px",background:"#1a0505",border:"1px solid #450a0a",borderRadius:10,color:"#f87171",fontSize:13}}>
+          <div>{err}</div>
+          <button onClick={analyze} style={{marginTop:8,padding:"6px 14px",background:"#2d0505",border:"1px solid #7a1414",borderRadius:8,color:"#f87171",fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>Try Again</button>
+        </div>}
 
         {/* Quick → Full upgrade */}
         {res&&res._mode==="quick"&&<div style={{marginTop:12,padding:"12px 16px",background:`${G}08`,border:`1px solid ${G}22`,borderRadius:10,cursor:"pointer"}} onClick={()=>{setMode("full");setTimeout(analyze,100)}}>
@@ -464,6 +514,57 @@ input:focus,textarea:focus,select:focus{border-color:${G}!important}
             </div>
           </div>}
         </div>}
+      </div>}
+
+      {/* ══════ BATCH SCAN ══════ */}
+      {tab==="batch"&&<div style={{animation:"fadeUp 0.3s ease"}}>
+        <div style={{...cd,marginBottom:14,borderColor:`${G}33`}}>
+          <div style={{...lb,color:G,marginBottom:4}}>Batch Scanner — identify many items at once</div>
+          <div style={{fontSize:12,color:MDC,lineHeight:1.5}}>Upload up to 20 photos. Gramma identifies each one simultaneously — results appear as they finish.</div>
+        </div>
+        <input ref={batchInputRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>handleBatchSelect(e.target.files)}/>
+        <div onClick={()=>batchInputRef.current?.click()} style={{border:`2px dashed ${batchFiles.length?BD:G+"44"}`,borderRadius:14,padding:"28px 16px",textAlign:"center",cursor:"pointer",marginBottom:14,background:"#0a0910"}}>
+          <div style={{fontSize:28,marginBottom:8}}>📸</div>
+          <div style={{fontSize:14,fontWeight:600,color:HI}}>Tap to add photos</div>
+          <div style={{fontSize:11,color:DM,marginTop:3}}>Select multiple from camera roll — up to 20 items</div>
+        </div>
+        {batchFiles.length>0&&<>
+          <div style={{display:"flex",gap:8,marginBottom:14}}>
+            <button onClick={runBatchScan} disabled={batchRunning||!batchFiles.some(f=>f.status==="idle")} style={{flex:1,padding:"14px",background:batchRunning||!batchFiles.some(f=>f.status==="idle")?"#1e1c2a":`linear-gradient(135deg,${G},#8b6914)`,border:"none",borderRadius:12,color:batchRunning||!batchFiles.some(f=>f.status==="idle")?DM:"#000",fontSize:14,fontWeight:700,cursor:batchRunning?"wait":"pointer",letterSpacing:"0.04em",textTransform:"uppercase"}}>
+              {batchRunning?`Scanning... ${batchFiles.filter(f=>f.status==="done"||f.status==="error").length}/${batchFiles.length} done`:
+                batchFiles.some(f=>f.status==="idle")?`⚡ Scan All (${batchFiles.filter(f=>f.status==="idle").length} items)`:"✓ All scanned"}
+            </button>
+            <button onClick={()=>setBatchFiles([])} style={{padding:"14px 16px",background:"none",border:`1px solid ${BD}`,borderRadius:12,color:DM,fontSize:13,cursor:"pointer"}}>Clear</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {batchFiles.map(item=>{
+              const bv=item.result?.verdict?VD[item.result.verdict]||VD["MAYBE"]:null;
+              return <div key={item.id} style={{...cd,padding:0,overflow:"hidden",position:"relative",cursor:"default"}}>
+                <img src={item.preview} alt="" style={{width:"100%",height:120,objectFit:"cover",display:"block"}}/>
+                <div style={{position:"absolute",top:6,right:6}}>
+                  {item.status==="loading"&&<div style={{width:22,height:22,border:`2px solid #2a2838`,borderTopColor:G,borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>}
+                  {item.status==="done"&&bv&&<div style={{background:bv.bdr,borderRadius:5,padding:"2px 7px",fontSize:10,fontWeight:700,color:"#000",letterSpacing:"0.04em"}}>{item.result.verdict==="STRONG BUY"?"⚡ SB":item.result.verdict}</div>}
+                  {item.status==="error"&&<div style={{background:"#7a1414",borderRadius:5,padding:"2px 7px",fontSize:10,color:"#f87171"}}>ERR</div>}
+                </div>
+                <button onClick={e=>{e.stopPropagation();setBatchFiles(prev=>prev.filter(f=>f.id!==item.id))}} style={{position:"absolute",top:6,left:6,background:"rgba(0,0,0,0.75)",border:"none",borderRadius:4,color:"#8a8698",width:22,height:22,fontSize:12,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+                <div style={{padding:"8px 10px"}}>
+                  {item.status==="idle"&&<div style={{fontSize:11,color:DM}}>Ready</div>}
+                  {item.status==="loading"&&<div style={{fontSize:11,color:G,fontStyle:"italic"}}>Gramma's looking...</div>}
+                  {item.status==="done"&&item.result&&<>
+                    <div style={{fontSize:12,fontWeight:600,color:HI,lineHeight:1.3,marginBottom:2}}>{item.result.brand_or_designer||"Unknown"}</div>
+                    <div style={{fontSize:10,color:MDC}}>{[item.result.era,item.result.item_type].filter(Boolean).join(" · ")}</div>
+                    {item.result.estimated_resale_high>0&&<div style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:bv?.txt||HI,marginTop:3}}>${item.result.estimated_resale_low?.toLocaleString()}–${item.result.estimated_resale_high?.toLocaleString()}</div>}
+                    <button onClick={()=>{setMode("full");setPhotos({main:item.compressed,mark:null,detail:null,extra:null});setPreviews({main:item.preview,mark:null,detail:null,extra:null});setRes(null);setErr(null);setPurchased(false);setListing(null);setTab("scan");}} style={{width:"100%",marginTop:6,padding:"5px",background:`${G}11`,border:`1px solid ${G}33`,borderRadius:6,color:G,fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>Full Appraisal →</button>
+                  </>}
+                  {item.status==="error"&&<>
+                    <div style={{fontSize:10,color:"#f87171",marginBottom:4}}>{item.error||"Scan failed"}</div>
+                    <button onClick={()=>setBatchFiles(prev=>prev.map(f=>f.id===item.id?{...f,status:"idle",error:null}:f))} style={{width:"100%",padding:"4px",background:"#2d0505",border:"1px solid #7a1414",borderRadius:5,color:"#f87171",fontSize:10,cursor:"pointer"}}>Retry</button>
+                  </>}
+                </div>
+              </div>;
+            })}
+          </div>
+        </>}
       </div>}
 
       {/* ══════ HISTORY ══════ */}

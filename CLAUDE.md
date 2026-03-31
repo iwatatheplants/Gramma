@@ -168,6 +168,40 @@ python3 api/ebay.py server
 
 Annual discount: 2 months free.
 
+## Current Sprint
+
+> Update this section at the start of each session.
+
+**Status**: Pre-launch / MVP buildout
+
+**Working on now**:
+- [ ] Rebuild landing page with Gramma branding (remove "Vintage Scout" references)
+- [ ] Integrate eBay active listing data into Full Appraisal results
+- [ ] Add scan counter per session to prevent accidental overuse
+
+**Recently completed**:
+- Batch photo scan tab (Promise.allSettled, parallel processing, per-card retry)
+- Client-side image compression (max 1200px, 82% JPEG)
+- Exponential backoff on API calls (3 retries, 2/4/8s)
+- Batch Haiku prescreening (8 listings per call, ~8x efficiency gain)
+- Local dev setup (Vite + fetch interceptor in src/main.jsx)
+- Registered askgramma.app and askgramma.io domains
+
+## Decision Log
+
+> Record key decisions here so they don't get re-litigated.
+
+| Date | Decision | Reason |
+|------|----------|--------|
+| 2026-03 | Primary domain: askgramma.app | askgramma.com parked by unrelated VPS company, .app is clean and enforces HTTPS |
+| 2026-03 | Skipped askgramma.ai ($100/yr) | Too expensive to park a redirect; trademark is the real protection |
+| 2026-03 | Skipped gramma.app ($1,988) | No ROI at MVP stage; revisit post-revenue |
+| 2026-03 | Wyoming LLC over California | Avoids $800/yr CA franchise tax; use Northwest Registered Agent (~$39/yr) |
+| 2026-03 | Form LLC before USPTO filing | Trademark should be filed under entity name from the start |
+| 2026-03 | Trademark "Ask Gramma!" Class 42 | AI/software services; file TEAS Plus after LLC is formed |
+| 2026-03 | Two-stage AI pipeline (Haiku + Sonnet) | Haiku filters ~80% junk at $0.001/listing before $0.04 Sonnet call |
+| 2026-03 | No Linear/Notion for project tracking | Solo founder; CLAUDE.md + GitHub Issues is sufficient |
+
 ## Competitive Positioning
 
 Gramma is NOT a generalist scanning tool. Gramma is a specialist for vintage

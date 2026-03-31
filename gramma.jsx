@@ -94,7 +94,9 @@ export default function App(){
   const [copied,setCopied]=useState(null);
   const [danceMode,setDanceMode]=useState("walk"); // walk, twerk
   const [batchFiles,setBatchFiles]=useState([]);
+  const [scanCount,setScanCount]=useState(()=>+(sessionStorage.getItem("gramma-sc")||0));
   const fileRefs=useRef({});const rRef=useRef(null);const listRef=useRef(null);const batchInputRef=useRef(null);
+  const cacheRef=useRef({});
 
   useEffect(()=>{(async()=>{try{const r=await window.storage.get("gramma-h");if(r?.value)setHist(JSON.parse(r.value))}catch{}})()},[]);
   const sH=async h=>{setHist(h);try{await window.storage.set("gramma-h",JSON.stringify(h.slice(0,100)))}catch{}};
@@ -103,6 +105,7 @@ export default function App(){
   useEffect(()=>{if(!loading)return;const iv=setInterval(()=>setDanceMode(d=>d==="walk"?"twerk":"walk"),3000);return()=>clearInterval(iv)},[loading]);
 
   const parseDataUrl=url=>({b64:url.split(",")[1],mt:url.match(/data:(image\/\w+);/)?.[1]||"image/jpeg"});
+  const photoHash=()=>Object.values(photos).filter(Boolean).map(d=>d.slice(-80)).join("|")+mode+desc+ask;
 
   const compressImage=useCallback((dataUrl,maxPx=1200,quality=0.82)=>new Promise(resolve=>{
     const img=new Image();img.onload=()=>{
@@ -179,6 +182,8 @@ export default function App(){
 
   const analyze=async()=>{
     if(!hasAnyPhoto&&!desc){setErr("Show Gramma a photo or describe what you've got, dear.");return;}
+    const key=photoHash();
+    if(cacheRef.current[key]){setRes(cacheRef.current[key]);setTimeout(()=>rRef.current?.scrollIntoView({behavior:"smooth",block:"start"}),120);return;}
     setLoading(true);setErr(null);setRes(null);setPurchased(false);setListing(null);
     const isQ=mode==="quick";
     const msgs=isQ?GRAMMA_LOADING.quick:GRAMMA_LOADING.full;
@@ -192,6 +197,8 @@ export default function App(){
     try{
       const parsed=await apiCall(isQ?"claude-haiku-4-5-20251001":"claude-sonnet-4-20250514",isQ?QUICK_SYS:FULL_SYS,p,!isQ,images);
       parsed._mode=mode;setRes(parsed);
+      cacheRef.current[key]=parsed;
+      const nc=scanCount+1;setScanCount(nc);sessionStorage.setItem("gramma-sc",nc);
       await sH([{id:Date.now(),ts:new Date().toISOString(),ask:ask?+ask:null,plat,desc:desc?.substring(0,120),mode,photoCount,r:parsed},...hist]);
       setTimeout(()=>rRef.current?.scrollIntoView({behavior:"smooth",block:"start"}),120);
     }catch(e){setErr(e.message)}finally{clearInterval(iv);setLoading(false);setLoadMsg("")}
@@ -297,7 +304,10 @@ input:focus,textarea:focus,select:focus{border-color:${G}!important}
           <div><div style={{fontFamily:"'Instrument Serif',Georgia,serif",fontSize:22,color:HI,fontStyle:"italic"}}>Gramma</div>
           <div style={{fontSize:9,color:DM,letterSpacing:"0.12em",textTransform:"uppercase",fontFamily:"'DM Mono',monospace"}}>Ask Gramma! — Vintage AI Appraiser</div></div>
         </div>
-        {st.tot>0&&<div style={{fontSize:11,fontFamily:"'DM Mono',monospace",color:MDC}}>{st.tot} scans · <span style={{color:"#4ade80"}}>{st.buys} buys</span></div>}
+        <div style={{textAlign:"right"}}>
+          {st.tot>0&&<div style={{fontSize:11,fontFamily:"'DM Mono',monospace",color:MDC}}>{st.tot} scans · <span style={{color:"#4ade80"}}>{st.buys} buys</span></div>}
+          <div style={{fontSize:10,fontFamily:"'DM Mono',monospace",color:scanCount>=10?"#f59e0b":DM,marginTop:2}}>{scanCount} session {scanCount===1?"scan":"scans"}{scanCount>=10?" · slow down, dear":""}</div>
+        </div>
       </div>
 
       {/* TABS */}
